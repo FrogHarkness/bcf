@@ -4,10 +4,21 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 import os
 
-def run_assignment(input_file, reviewer_capacities=None, demand=2):
+# Default mapping of preference strings to scores
+DEFAULT_PREFERENCE_SCORES = {
+    "Conflict of Interest": -100,
+    "None": -100,
+    "Moderate": 1,
+    "Moderate*": 1,
+    "Moderate**": 1,
+    "Considerable": 5,
+    "Considerable*": 5,
+    "Considerable**": 5
+}
+
+def run_assignment(input_file, reviewer_capacities=None, demand=2, preference_scores=None):
     df = pd.read_excel(input_file)
     
-    df = df[:20]  # Limit to first 20 reviewers
     df = df.drop(columns=['Reviewers'])
     
     M = df.shape[1]  # Number of papers
@@ -15,17 +26,12 @@ def run_assignment(input_file, reviewer_capacities=None, demand=2):
     
     simmatrix = np.zeros((M, N), dtype=float)
     
-    PREFERENCE_SCORES = {
-        "Conflict of Interest": -100,
-        "None": -100,
-        None: -100,
-        "Moderate": 1,
-        "Moderate*": 1,
-        "Moderate**": 1,
-        "Considerable": 5,
-        "Considerable*": 5,
-        "Considerable**": 5
-    }
+    # Use provided preferences or defaults
+    if preference_scores is None:
+        PREFERENCE_SCORES = DEFAULT_PREFERENCE_SCORES.copy()
+    else:
+        # copy to avoid mutating caller data
+        PREFERENCE_SCORES = preference_scores.copy()
     
     for paper_idx in range(M):
         for rev_idx in range(N):
@@ -60,8 +66,8 @@ def run_assignment(input_file, reviewer_capacities=None, demand=2):
         demand=demand,
         ability=reviewer_capacities,  # Use individual capacities
         function=lambda x: x,
-        iter_limit=900000,
-        time_limit=9000
+        iter_limit=9999000,
+        time_limit=99900
     ).fair_assignment()
     
     # Calculate the number of papers assigned to each reviewer
@@ -94,22 +100,21 @@ def run_assignment(input_file, reviewer_capacities=None, demand=2):
             # Take top 4
             backup_reviewers[paper_idx] = paper_scores[:4]
     
-    # Create the main assignment dataframe
+    # Create assignment and names DataFrames with ordered first two by preference
     ndf = pd.DataFrame(columns=df.columns)
-    for col_idx, (row1, row2) in res.items():
-        if col_idx < len(df.columns):
-            col_name = df.columns[col_idx]
-            ndf.at[0, col_name] = df.iloc[row1, col_idx]
-            ndf.at[1, col_name] = df.iloc[row2, col_idx]
-    
-    # Create the dataframe with reviewer names
-    withnameoriginaldf = pd.read_excel(input_file)
     nameevodf = pd.DataFrame(columns=df.columns)
-    for col_idx, (row1, row2) in res.items():
+    withnameoriginaldf = pd.read_excel(input_file)
+    for col_idx, reviewers in res.items():
         if col_idx < len(df.columns):
             col_name = df.columns[col_idx]
-            nameevodf.at[0, col_name] = withnameoriginaldf.iloc[row1, 0]
-            nameevodf.at[1, col_name] = withnameoriginaldf.iloc[row2, 0]
+            r1, r2 = reviewers
+            # Order by numeric preference score
+            if simmatrix[r2, col_idx] > simmatrix[r1, col_idx]:
+                r1, r2 = r2, r1
+            ndf.at[0, col_name] = df.iloc[r1, col_idx]
+            ndf.at[1, col_name] = df.iloc[r2, col_idx]
+            nameevodf.at[0, col_name] = withnameoriginaldf.iloc[r1, 0]
+            nameevodf.at[1, col_name] = withnameoriginaldf.iloc[r2, 0]
     
     # Add backup reviewers
     for paper_idx, backups in backup_reviewers.items():
@@ -118,6 +123,15 @@ def run_assignment(input_file, reviewer_capacities=None, demand=2):
             for i, (rev_idx, score, count) in enumerate(backups):
                 nameevodf.at[i+2, col_name] = f"{withnameoriginaldf.iloc[rev_idx, 0]} ({count})"
                 ndf.at[i+2, col_name] = f"{df.iloc[rev_idx, paper_idx]} ({count})"
+    
+    # Insert blank separator row and label rows
+    sep_name = pd.DataFrame([[''] * len(df.columns)], columns=df.columns)
+    sep_num  = pd.DataFrame([[''] * len(df.columns)], columns=df.columns)
+    nameevodf = pd.concat([nameevodf.iloc[:2], sep_name, nameevodf.iloc[2:]], ignore_index=True)
+    ndf        = pd.concat([ndf.iloc[:2],      sep_num,  ndf.iloc[2:]],      ignore_index=True)
+    labels = ['Assigner Rank 1', 'Assigner Rank 2', '', 'Backup 1', 'Backup 2', 'Backup 3', 'Backup 4']
+    nameevodf.index = labels
+    ndf.index        = labels
     
     # Create a summary table of reviewer assignments
     summary_df = pd.DataFrame(columns=["Reviewer", "Number of Assignments", "Capacity"])
@@ -154,14 +168,17 @@ def run_assignment(input_file, reviewer_capacities=None, demand=2):
     print(f"\nMinimum Paper Score: {paper_scores_df['Overall Score'].min()}")
     print(f"Average Paper Score: {paper_scores_df['Overall Score'].mean():.2f}")
     
+    # Derive output filename based on input file
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    output_filename = f"{base_name}_pr_result.xlsx"
     # Create a writer to save multiple sheets
-    with pd.ExcelWriter('final_result.xlsx') as writer:
-        nameevodf.to_excel(writer, sheet_name='Reviewer Assignments')
-        ndf.to_excel(writer, sheet_name='Raw Assignments')
+    with pd.ExcelWriter(output_filename) as writer:
+        nameevodf.to_excel(writer, sheet_name='Reviewer Assignments', index=True)
+        ndf.to_excel(writer, sheet_name='Raw Assignments', index=True)
         summary_df.to_excel(writer, sheet_name='Assignment Summary')
         paper_scores_df.to_excel(writer, sheet_name='Paper Scores')
     
-    return res, summary_df, paper_scores_df
+    return res, summary_df, paper_scores_df, output_filename
 
 # Keep the auto_assigner class as is
 from gurobipy import Model, GRB
@@ -459,7 +476,20 @@ class PeerReviewerApp:
         # Default demand
         ttk.Label(self.top_frame, text="Reviewers per Paper:").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.demand_var = tk.IntVar(value=2)
-        ttk.Spinbox(self.top_frame, from_=1, to=10, textvariable=self.demand_var, width=5).grid(row=1, column=1, sticky=tk.W, pady=5)
+        ttk.Spinbox(self.top_frame, from_=1, to=30, textvariable=self.demand_var, width=5).grid(row=1, column=1, sticky=tk.W, pady=5)
+        
+        # Initialize default capacity variable and modified status tracker
+        self.default_capacity_var = tk.IntVar(value=8)
+        self.modified_indices = set()
+        ttk.Label(self.top_frame, text="Default Capacity:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        default_spin = ttk.Spinbox(self.top_frame, from_=1, to=100, textvariable=self.default_capacity_var, width=5)
+        default_spin.grid(row=2, column=1, sticky=tk.W, pady=5)
+        # Trace changes to default capacity to update unmodified reviewers
+        self.default_capacity_var.trace_add('write', self.on_default_capacity_change)
+        
+        # Initialize preference scores mapping and management button
+        self.preference_scores = DEFAULT_PREFERENCE_SCORES.copy()
+        ttk.Button(self.top_frame, text="Manage Preferences", command=self.open_preferences).grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
         
         # Table for reviewer capacities
         self.create_table()
@@ -488,6 +518,9 @@ class PeerReviewerApp:
         
         # Bind double-click event for editing
         self.tree.bind("<Double-1>", self.edit_capacity)
+        
+        # Configure tag for highlighting modified capacities
+        self.tree.tag_configure('modified', foreground='lightblue')
     
     def browse_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
@@ -509,8 +542,10 @@ class PeerReviewerApp:
             for item in self.tree.get_children():
                 self.tree.delete(item)
             
-            # Reset capacities to default
-            self.reviewer_capacities = [8] * len(self.reviewer_names)
+            # Reset capacities to default and clear modification flags
+            default = self.default_capacity_var.get()
+            self.reviewer_capacities = [default] * len(self.reviewer_names)
+            self.modified_indices.clear()
             
             # Add reviewers to the table
             for i, name in enumerate(self.reviewer_names):
@@ -555,16 +590,32 @@ class PeerReviewerApp:
             idx = self.tree.index(item)
             self.reviewer_capacities[idx] = capacity_var.get()
             
+            # Mark this capacity as modified and highlight it
+            self.modified_indices.add(idx)
+            self.tree.item(item, tags=('modified',))
+            
             popup.destroy()
         
         ttk.Button(popup, text="Save", command=save_capacity).pack(pady=5)
     
     def reset_capacities(self):
-        # Set all capacities to 8
+        # Reset all capacities to the default and clear modifications
+        default = self.default_capacity_var.get()
         for i, item in enumerate(self.tree.get_children()):
             reviewer_name = self.tree.item(item, "values")[0]
-            self.tree.item(item, values=(reviewer_name, 8))
-            self.reviewer_capacities[i] = 8
+            self.tree.item(item, values=(reviewer_name, default))
+            self.reviewer_capacities[i] = default
+            # Remove modified highlight
+            self.tree.item(item, tags=())
+        self.modified_indices.clear()
+    
+    def on_default_capacity_change(self, *args):
+        """Update unmodified capacities when default changes"""
+        default = self.default_capacity_var.get()
+        for idx, item in enumerate(self.tree.get_children()):
+            if idx not in self.modified_indices:
+                self.tree.set(item, "Capacity", default)
+                self.reviewer_capacities[idx] = default
     
     def run_assignment(self):
         if not self.file_path:
@@ -579,24 +630,101 @@ class PeerReviewerApp:
             # Get demand
             demand = self.demand_var.get()
             
-            # Run the assignment
-            result = run_assignment(
+            # Validate that every capacity meets the demand
+            if any(cap < demand for cap in self.reviewer_capacities):
+                tk.messagebox.showerror("Error", f"Reviewer capacities must be at least {demand} (Reviewers per Paper)")
+                return
+            
+            # Run the assignment and get output filename
+            res, summary_df, paper_scores_df, output_file = run_assignment(
                 input_file=self.file_path,
                 reviewer_capacities=self.reviewer_capacities,
-                demand=demand
+                demand=demand,
+                preference_scores=self.preference_scores
             )
             
-            # Show success message
+            # Show success message with dynamic filename
             tk.messagebox.showinfo("Success", 
                 "Assignment completed successfully!\n"
-                "Results saved to final_result.xlsx")
+                f"Results saved to {output_file}")
             
             # Open the output file
-            if os.path.exists("final_result.xlsx"):
-                os.system("open final_result.xlsx" if sys.platform == "darwin" else "start final_result.xlsx")
+            if os.path.exists(output_file):
+                os.system(f"open \"{output_file}\"" if sys.platform == "darwin" else f"start \"{output_file}\"")
                 
         except Exception as e:
             tk.messagebox.showerror("Error", f"Assignment failed: {str(e)}")
+
+    def open_preferences(self):
+        # Popup to manage preference-to-score mapping
+        window = tk.Toplevel(self.root)
+        window.title("Manage Preferences")
+        window.geometry("400x300")
+        columns = ("Preference", "Score")
+        tree = ttk.Treeview(window, columns=columns, show="headings")
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=150)
+        # Populate current mappings
+        for label, score in self.preference_scores.items():
+            tree.insert("", tk.END, values=(label, score))
+        tree.pack(fill=tk.BOTH, expand=True, pady=5)
+        # Buttons frame
+        btn_frame = ttk.Frame(window)
+        btn_frame.pack(fill=tk.X, padx=5)
+        ttk.Button(btn_frame, text="Add", command=lambda: self._add_pref(tree)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Edit", command=lambda: self._edit_pref(tree)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Delete", command=lambda: self._delete_pref(tree)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=window.destroy).pack(side=tk.RIGHT, padx=5)
+
+    def _add_pref(self, tree):
+        popup = tk.Toplevel(self.root)
+        popup.title("Add Preference")
+        ttk.Label(popup, text="Label:").pack(pady=5)
+        label_var = tk.StringVar()
+        ttk.Entry(popup, textvariable=label_var).pack()
+        ttk.Label(popup, text="Score:").pack(pady=5)
+        score_var = tk.IntVar(value=0)
+        ttk.Spinbox(popup, from_=-1000, to=1000, textvariable=score_var).pack()
+        def save():
+            label = label_var.get().strip()
+            score = score_var.get()
+            if label:
+                self.preference_scores[label] = score
+                tree.insert("", tk.END, values=(label, score))
+            popup.destroy()
+        ttk.Button(popup, text="Save", command=save).pack(pady=5)
+
+    def _edit_pref(self, tree):
+        selected = tree.selection()
+        if not selected:
+            return
+        item = selected[0]
+        old_label, old_score = tree.item(item, "values")
+        popup = tk.Toplevel(self.root)
+        popup.title("Edit Preference")
+        ttk.Label(popup, text="Label:").pack(pady=5)
+        label_var = tk.StringVar(value=old_label)
+        ttk.Entry(popup, textvariable=label_var).pack()
+        ttk.Label(popup, text="Score:").pack(pady=5)
+        score_var = tk.IntVar(value=int(old_score))
+        ttk.Spinbox(popup, from_=-1000, to=1000, textvariable=score_var).pack()
+        def save():
+            new_label = label_var.get().strip()
+            new_score = score_var.get()
+            if new_label != old_label:
+                self.preference_scores.pop(old_label, None)
+            self.preference_scores[new_label] = new_score
+            tree.item(item, values=(new_label, new_score))
+            popup.destroy()
+        ttk.Button(popup, text="Save", command=save).pack(pady=5)
+
+    def _delete_pref(self, tree):
+        selected = tree.selection()
+        for item in selected:
+            label = tree.item(item, "values")[0]
+            self.preference_scores.pop(label, None)
+            tree.delete(item)
 
 # Import for packaging
 import sys

@@ -1,0 +1,3 @@
+([('prer_',
+   '/Users/rossi/Desktop/script/peer_reviewer/dist/prer_',
+   'EXECUTABLE')],)
